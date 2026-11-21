@@ -1,0 +1,304 @@
+desc:Nodus Loop Compare EQ
+tags:equalizer analysis
+in_pin:Left
+in_pin:Right
+out_pin:Left
+out_pin:Right
+slider1:command=0<0,7,1{Idle,Arm reference loop,Arm target loop,Start manual reference,Start manual target,Finish manual capture,Cancel capture,Clear all}>Capture
+slider2:listen=0<0,3,1{Dry,EQ level matched,EQ actual level,Delta (dry minus actual EQ)}>Listen
+slider3:strength=65<0,100,1>Strength (%)
+slider4:limit_db=4<0,9,0.1>Maximum change per band (dB)
+
+@init
+ext_noinit = 1;
+bands = 7;
+stride = 18;
+// Each band stores its center frequency, analysis and EQ filter states,
+// accumulated energy, captured powers, and the current EQ gain.
+frequency = 0;
+analysis_b = 1;
+analysis_a1 = 2;
+analysis_a2 = 3;
+analysis_l1 = 4;
+analysis_l2 = 5;
+analysis_r1 = 6;
+analysis_r2 = 7;
+energy = 8;
+reference = 9;
+target = 10;
+gain = 11;
+eq_b0 = 12;
+eq_a1 = 13; // The EQ's b1 and a1 are identical.
+eq_b2 = 14;
+eq_a2 = 15;
+eq_l1 = 16;
+eq_r1 = 17;
+// Second EQ state for each channel lives in a small separate bank.
+eq_l2_base = 160;
+eq_r2_base = 168;
+centers = 180;
+centers[0] = 80;
+centers[1] = 180;
+centers[2] = 400;
+centers[3] = 900;
+centers[4] = 2000;
+centers[5] = 4500;
+centers[6] = 10000;
+dry_mix = 1;
+wet_mix = 0;
+matched_mix = 0;
+level_gain = 1;
+
+function configure(rate) local(i, band, angle, alpha, denom) (
+  rate_in_use = rate;
+  i = 0;
+  loop(bands,
+    band = i * stride;
+    band[frequency] = centers[i];
+    angle = 2 * $pi * centers[i] / rate;
+    centers[i] < rate * 0.43 ? (
+      alpha = sin(angle) / (2 * 1.35);
+      denom = 1 + alpha;
+      band[analysis_b] = alpha / denom;
+      band[analysis_a1] = -2 * cos(angle) / denom;
+      band[analysis_a2] = (1 - alpha) / denom;
+    ) : band[analysis_b] = 0;
+    band[analysis_l1] = band[analysis_l2] = 0;
+    band[analysis_r1] = band[analysis_r2] = 0;
+    band[eq_l1] = band[eq_r1] = 0;
+    eq_l2_base[i] = eq_r2_base[i] = 0;
+    i += 1;
+  );
+  route_step = 1 - exp(-1 / (rate * 0.012));
+  meter_step = 1 - exp(-1 / (rate * 0.35));
+  level_step = 1 - exp(-1 / (rate * 0.20));
+);
+
+function begin_capture() local(i, band) (
+  i = 0;
+  loop(bands,
+    band = i * stride;
+    band[energy] = 0;
+    band[analysis_l1] = band[analysis_l2] = 0;
+    band[analysis_r1] = band[analysis_r2] = 0;
+    i += 1;
+  );
+  capture_samples = 0;
+  capture_power = 0;
+  capture_state = 2;
+  status = 0;
+);
+
+function finish_capture() local(i, band, avg) (
+  // A quiet or very short attempt leaves the last successful capture intact.
+  capture_samples >= 0.05 * srate &&
+  capture_power / max(1, capture_samples) > 0.0000000001 ? (
+    avg = capture_power / capture_samples;
+    i = 0;
+    loop(bands,
+      band = i * stride;
+      band[capture_slot == 1 ? reference : target] =
+        band[energy] / capture_samples / avg;
+      i += 1;
+    );
+    capture_slot == 1 ? have_reference = 1 : have_target = 1;
+    status = capture_slot;
+  ) : status = 3;
+  capture_state = 0;
+);
+
+function build_curve() local(i, band, delta, weight, total, weights, center, want, k, angle, alpha, amp, denom) (
+  // Use the center of the well-supported band differences as the zero dB
+  // point. The supplied recording's overall gain is irrelevant to the curve.
+  i = 0;
+  total = weights = 0;
+  have_reference && have_target ? (
+    loop(bands,
+      band = i * stride;
+      weight = min(band[reference], band[target]);
+      band[analysis_b] > 0 && weight > 0.00001 ? (
+        weight = min(1, sqrt(weight) * 8);
+        delta = 10 * log10(band[reference] / band[target]);
+        total += weight * max(-24, min(24, delta));
+        weights += weight;
+      );
+      i += 1;
+    );
+  );
+  center = weights > 0 ? total / weights : 0;
+  k = 1 - exp(-samplesblock / (srate * 0.045));
+  i = 0;
+  loop(bands,
+    band = i * stride;
+    want = 0;
+    weight = min(band[reference], band[target]);
+    weights > 0 && band[analysis_b] > 0 && weight > 0.00001 ? (
+      delta = 10 * log10(band[reference] / band[target]) - center;
+      want = max(-limit_db, min(limit_db, delta * strength * 0.01));
+    );
+    band[gain] += k * (want - band[gain]);
+    abs(band[gain] - want) < 0.00001 ? band[gain] = want;
+    band[analysis_b] > 0 ? (
+      angle = 2 * $pi * band[frequency] / srate;
+      alpha = sin(angle) / (2 * 1.45);
+      amp = 10 ^ (band[gain] / 40);
+      denom = 1 + alpha / amp;
+      band[eq_b0] = (1 + alpha * amp) / denom;
+      band[eq_a1] = -2 * cos(angle) / denom;
+      band[eq_b2] = (1 - alpha * amp) / denom;
+      band[eq_a2] = (1 - alpha / amp) / denom;
+    );
+    i += 1;
+  );
+);
+
+@serialize
+file_var(0, have_reference);
+file_var(0, have_target);
+serial_i = 0;
+loop(bands,
+  serial_band = serial_i * stride;
+  file_var(0, serial_band[reference]);
+  file_var(0, serial_band[target]);
+  serial_i += 1;
+);
+
+@block
+rate_in_use != srate ? (
+  rate_in_use > 0 && capture_state > 0 ? (
+    capture_state = 0;
+    status = 4;
+  );
+  configure(srate);
+  was_playing = 0;
+);
+
+playing = play_state == 1 || play_state == 5;
+// JSFX sees block positions. A backwards discontinuity during continuous
+// playback is the cue. Scrubbing or seeking backwards is ambiguous.
+wrapped = playing && was_playing &&
+  play_position < previous_position - 0.00001;
+jumped_forward = playing && was_playing &&
+  play_position > previous_position + previous_duration + max(0.045, 2 * previous_duration);
+previous_position = play_position;
+previous_duration = samplesblock / srate;
+was_playing = playing;
+
+capture_state == 2 && (!playing || jumped_forward || (!loop_capture && wrapped)) ? (
+  capture_state = 0;
+  status = 4;
+);
+wrapped && loop_capture ? (
+  capture_state == 1 ? begin_capture() :
+  capture_state == 2 ? finish_capture();
+);
+
+command > 0 ? (
+  command <= 4 ? (
+    capture_slot = command == 1 || command == 3 ? 1 : 2;
+    loop_capture = command <= 2;
+    status = 0;
+    loop_capture ? capture_state = 1 :
+      playing ? begin_capture() : (capture_state = 0; status = 5;);
+  ) :
+  command == 5 && capture_state == 2 && !loop_capture ? finish_capture() :
+  command == 6 ? (capture_state = 0; status = 0;) :
+  command == 7 ? (
+    capture_state = 0;
+    have_reference = have_target = 0;
+    status = 0;
+  );
+  command = 0;
+  sliderchange(1);
+);
+
+build_curve();
+// Crossfade routes over 12 ms. Delta is defined before level matching.
+dry_want = listen == 0 || listen == 3;
+wet_want = listen == 2 ? 1 : listen == 3 ? -1 : 0;
+matched_want = listen == 1;
+!route_initialized ? (
+  dry_mix = dry_want;
+  wet_mix = wet_want;
+  matched_mix = matched_want;
+  route_initialized = 1;
+);
+
+@sample
+in_l = spl0;
+in_r = spl1;
+capture_state == 2 && playing ? (
+  capture_samples += 1;
+  capture_power += 0.5 * (in_l * in_l + in_r * in_r);
+  sample_index = 0;
+  loop(bands,
+    sample_band = sample_index * stride;
+    bp_l = sample_band[analysis_b] * in_l + sample_band[analysis_l1];
+    bp_r = sample_band[analysis_b] * in_r + sample_band[analysis_r1];
+    sample_band[analysis_l1] = sample_band[analysis_l2] - sample_band[analysis_a1] * bp_l;
+    sample_band[analysis_r1] = sample_band[analysis_r2] - sample_band[analysis_a1] * bp_r;
+    sample_band[analysis_l2] = -sample_band[analysis_b] * in_l - sample_band[analysis_a2] * bp_l;
+    sample_band[analysis_r2] = -sample_band[analysis_b] * in_r - sample_band[analysis_a2] * bp_r;
+    sample_band[energy] += 0.5 * (bp_l * bp_l + bp_r * bp_r);
+    sample_index += 1;
+  );
+);
+
+out_l = in_l;
+out_r = in_r;
+sample_index = 0;
+loop(bands,
+  sample_band = sample_index * stride;
+  sample_band[analysis_b] > 0 ? (
+    eq_out_l = sample_band[eq_b0] * out_l + sample_band[eq_l1];
+    eq_out_r = sample_band[eq_b0] * out_r + sample_band[eq_r1];
+    sample_band[eq_l1] = sample_band[eq_a1] * (out_l - eq_out_l) + eq_l2_base[sample_index];
+    sample_band[eq_r1] = sample_band[eq_a1] * (out_r - eq_out_r) + eq_r2_base[sample_index];
+    eq_l2_base[sample_index] = sample_band[eq_b2] * out_l - sample_band[eq_a2] * eq_out_l;
+    eq_r2_base[sample_index] = sample_band[eq_b2] * out_r - sample_band[eq_a2] * eq_out_r;
+    out_l = eq_out_l;
+    out_r = eq_out_r;
+  );
+  sample_index += 1;
+);
+dry_power += meter_step * (0.5 * (in_l * in_l + in_r * in_r) - dry_power);
+wet_power += meter_step * (0.5 * (out_l * out_l + out_r * out_r) - wet_power);
+level_want = 1;
+dry_power > 0.0000000001 && wet_power > 0.0000000001 ?
+  level_want = max(0.355, min(2.818, sqrt(dry_power / wet_power)));
+level_gain += level_step * (level_want - level_gain);
+
+dry_mix += route_step * (dry_want - dry_mix);
+wet_mix += route_step * (wet_want - wet_mix);
+matched_mix += route_step * (matched_want - matched_mix);
+spl0 = dry_mix * in_l + (wet_mix + matched_mix * level_gain) * out_l;
+spl1 = dry_mix * in_r + (wet_mix + matched_mix * level_gain) * out_r;
+
+@gfx 470 145
+gfx_clear = 0x201915;
+gfx_setfont(1, "Arial", 15);
+gfx_set(0.94, 0.91, 0.85, 1);
+gfx_x = 14; gfx_y = 12;
+gfx_printf("Reference %s     Target %s",
+  have_reference ? "ready" : "empty", have_target ? "ready" : "empty");
+gfx_x = 14; gfx_y = 35;
+capture_state == 1 ? gfx_printf("Armed for the next loop restart (%s)", capture_slot == 1 ? "reference" : "target") :
+capture_state == 2 ? gfx_printf("Capturing %s   %.1f s", capture_slot == 1 ? "reference" : "target", capture_samples / srate) :
+status == 3 ? gfx_drawstr("Capture too short or quiet. Previous capture kept.") :
+status == 4 ? gfx_drawstr("Capture interrupted. Previous capture kept.") :
+status == 5 ? gfx_drawstr("Start playback before starting manual capture.") :
+gfx_drawstr("Play a passage to capture it. Repeat ON for loop capture.");
+gfx_x = 14; gfx_y = 64;
+gfx_set(0.63, 0.84, 0.77, 1);
+gfx_printf("EQ band gains (dB)    |    A/B trim %+.1f dB", 20 * log10(max(0.001, level_gain)));
+draw_index = 0;
+loop(bands,
+  draw_band = draw_index * stride;
+  gfx_x = 14 + draw_index * (gfx_w - 18) / bands;
+  gfx_y = 91;
+  gfx_printf("%d Hz", centers[draw_index]);
+  gfx_x = 14 + draw_index * (gfx_w - 18) / bands;
+  gfx_y = 113;
+  gfx_printf("%+.1f", draw_band[gain]);
+  draw_index += 1;
+);
